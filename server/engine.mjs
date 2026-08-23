@@ -297,7 +297,15 @@ async function ensureHls(torrent, file, ih, idx) {
   job.ready = (async () => {
     const probe = (job.probe = (await probeHead(file)) || { video: null, audio: null });
     const copyAudio = probe.audio && BROWSER_AUDIO.has(probe.audio);
-    const args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-i', 'pipe:0',
+    const args = ['-hide_banner', '-loglevel', 'error', '-nostdin',
+      /* INMEM plays a movie through a bounded sliding window (delete_segments). Without
+         pacing, ffmpeg races the whole file to segments at ~50x realtime and evicts the
+         opening of the movie before the browser attaches — the viewer lands in the
+         credits. Pace input to ~realtime so the window tracks the playhead and the
+         player's startPosition:0 lands on t=0. (localhost keeps every segment, no pacing
+         needed there.) */
+      ...(INMEM ? ['-re'] : []),
+      '-i', 'pipe:0',
       '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
       '-c:v', 'copy', ...(probe.video === 'hevc' ? ['-tag:v', 'hvc1'] : []),
       /* pad explicit silence so audio starts at pts 0 like the video (MKVs often start audio
