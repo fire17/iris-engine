@@ -18,17 +18,18 @@ on:
     inputs:
       room:  { description: floor room, default: iris-hp-runner-v1 }
       force: { description: bypass the pool gate (always run), default: 'false' }
-  # schedule disabled for the controlled test — enable to run the 24/7 pool (ToS risk)
-  # schedule:
-  #   - cron: '*/5 * * * *'
+  # 24/7 always-warm pool: cron admits through the gate below, which keeps ~POOL runners
+  # overlapping so the discovery floor always has a live URL (no "no runner" gaps).
+  schedule:
+    - cron: '*/5 * * * *'
 
 permissions:
   contents: read
   actions: read
 
 env:
-  POOL: '2'        # target overlapping live runs (lower than baton's 3 — ToS-conservative)
-  STAGGER: '1650'  # seconds; admit a replacement once the youngest run is this old (≈ RUN_SECONDS / POOL)
+  POOL: '2'         # target overlapping live runs (lower than baton's 3 — ToS-conservative)
+  STAGGER: '9600'   # seconds; admit a replacement once the youngest run is this old (≈ RUN_SECONDS / POOL = 19200/2)
 
 jobs:
   admit:
@@ -66,7 +67,7 @@ jobs:
     needs: admit
     if: ${{ needs.admit.outputs.go == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 350   # must exceed RUN_SECONDS (5h20m); GitHub hard-caps a job at 6h
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -97,8 +98,8 @@ jobs:
         env:
           HP_ROOM:      '${{ inputs.room || ''iris-hp-runner-v1'' }}'
           HP_INMEM:     '1'
-          RUN_SECONDS:  '3300'    # 55 min
-          HANDOFF_AT:   '3180'    # stop announcing ~2 min before close
+          RUN_SECONDS:  '19200'   # 5h20m per run (long-lived pool members → fewer handoffs)
+          HANDOFF_AT:   '19080'   # stop announcing ~2 min before close
           HP_MAX_BYTES: '4294967296'   # 4 GiB per-file cap (ubuntu-latest ~16 GiB RAM)
           HP_MAX_TORRENTS: '2'
           HP_ENGINE_PRIV: ${{ secrets.HP_ENGINE_PRIV }}
