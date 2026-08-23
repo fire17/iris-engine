@@ -306,6 +306,19 @@ async function ensureHls(torrent, file, ih, idx, startT = 0) {
   fs.rmSync(dir, { recursive: true, force: true }); fs.mkdirSync(dir, { recursive: true });
   job = { dir, proc: null, probe: null, ready: null, startT };
   jobs.set(key, job);
+  /* FIRST-FRAME SPEED (cold start only): with -c:v copy the first HLS segment cannot appear
+     until the first source GOP has arrived over the swarm — that piece-wait, not the
+     transcode, dominates a cold start. Mark the head of the file CRITICAL (highest priority,
+     fetched in order NOW) so the swarm races the opening ~16 MB in instead of spreading
+     bandwidth across the whole film. Seeks (startT>0) read deep in the file via -ss and are
+     left to the normal streaming prioritisation. */
+  if (startT === 0) try {
+    const pieceLen = torrent.pieceLength || (1 << 18);
+    const p0 = Math.floor(file.offset / pieceLen);
+    const pN = Math.floor((file.offset + file.length - 1) / pieceLen);
+    torrent.select(p0, Math.min(pN, p0 + Math.ceil((16 * 1024 * 1024) / pieceLen)), 1);
+    torrent.critical(p0, Math.min(pN, p0 + Math.ceil((4 * 1024 * 1024) / pieceLen)));
+  } catch { /* prioritisation is an optimisation, never fatal */ }
   job.ready = (async () => {
     const probe = (job.probe = (await probeHead(file)) || { video: null, audio: null });
     const copyAudio = probe.audio && BROWSER_AUDIO.has(probe.audio);
@@ -539,6 +552,24 @@ const server = http.createServer((req, res) => {
     });
     try { fs.unlinkSync(torrentFilePath(infoHash)); } catch { /* may not exist */ }
     return send(res, 200, { ok: true, removed: infoHash });
+  }
+
+  // GET /prime/<infoHash>[/<fileIdx>]  -> 202 immediately; warms metadata + starts the
+  // transcode in the BACKGROUND so a later /play returns near-instantly. The client fires
+  // this while the user is still browsing/previewing a title, so playback feels instant on
+  // click. Non-blocking by design — never awaits ensureHls. Same rate-limit gate as /play.
+  if (parts[0] === 'prime' && (parts.length === 2 || parts.length === 3)) {
+    const infoHash = normaliseHash(parts[1]);
+    if (!infoHash) return send(res, 400, { ok: false, error: 'invalid infoHash' });
+    const idx = parts.length === 3 ? Number.parseInt(parts[2], 10) : NaN;
+    if (!findTorrent(infoHash) && !allowAdd()) return send(res, 429, { ok: false, error: 'rate limited' });
+    addTorrent(infoHash).then((torrent) => {
+      const file = pickFile(torrent, Number.isNaN(idx) ? null : idx);
+      if (!file || file.length > HP_MAX_BYTES) return;
+      if (DIRECT_EXT.has(extOf(file.name))) return;   // browser-native: direct Range, no warmup needed
+      ensureHls(torrent, file, infoHash, torrent.files.indexOf(file), 0).catch(() => {});
+    }).catch(() => {});
+    return send(res, 202, { ok: true, priming: infoHash });
   }
 
   // GET /play/<infoHash>[/<fileIdx>]  -> {kind:'url'|'hls', url, file, probe}
