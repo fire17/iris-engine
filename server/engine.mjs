@@ -165,6 +165,33 @@ function waitForMetadata(torrent, infoHash) {
   });
 }
 
+/* Fetch the .torrent BYTES from an HTTP cache so metadata is INSTANT and needs no
+   peer (the browser-sandbox lesson applied server-side: a bare magnet on a restricted
+   network — e.g. a CI runner — may never get ut_metadata; a .torrent gives the file
+   list immediately, and a webseeded .torrent even serves data with zero peers). */
+const DOT_TORRENT_CACHES = (process.env.HP_TORRENT_CACHES ||
+  'https://itorrents.org/torrent/{IH}.torrent').split(',').map((s) => s.trim()).filter(Boolean);
+async function fetchDotTorrent(infoHash) {
+  const IH = infoHash.toUpperCase(), ih = infoHash.toLowerCase();
+  for (const tpl of DOT_TORRENT_CACHES) {
+    try {
+      const url = tpl.replace('{IH}', IH).replace('{ih}', ih);
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 8000);
+      const r = await fetch(url, { signal: ac.signal, redirect: 'follow' });
+      clearTimeout(timer);
+      if (!r.ok) continue;
+      const buf = Buffer.from(await r.arrayBuffer());
+      // a real .torrent is a bencoded dict ('d' ...) carrying an 'info' key
+      if (buf.length > 100 && buf[0] === 0x64 && buf.includes(Buffer.from('4:infod'))) {
+        console.error('[torrent] metadata via cache (' + buf.length + 'B) ' + ih);
+        return buf;
+      }
+    } catch { /* try next cache */ }
+  }
+  return null;
+}
+
 function addTorrent(infoHash) {
   const have = findTorrent(infoHash);
   if (have && have.files.length) return Promise.resolve(have);
@@ -185,12 +212,15 @@ function addTorrent(infoHash) {
       // INMEM: keep the store in RAM (memory-chunk-store) and touch no disk — no
       // cached .torrent read/write. Localhost: FSChunkStore under .cache, as before.
       const addOpts = INMEM ? { store: MemoryChunkStore } : { path: CACHE };
-      const src = (!INMEM && readCachedTorrent(infoHash)) || ('magnet:?xt=urn:btih:' + infoHash);
       if (INMEM) evictLRU(infoHash);
-      const torrent = client.add(src, addOpts);
-      return waitForMetadata(torrent, infoHash).then((t) => {
-        if (!INMEM) cacheTorrentFile(infoHash, t);
-        return t;
+      // .torrent bytes (instant metadata, peerless) -> cached .torrent -> bare magnet
+      return fetchDotTorrent(infoHash).then((dot) => {
+        const src = dot || (!INMEM && readCachedTorrent(infoHash)) || ('magnet:?xt=urn:btih:' + infoHash);
+        const torrent = client.add(src, addOpts);
+        return waitForMetadata(torrent, infoHash).then((t) => {
+          if (!INMEM) cacheTorrentFile(infoHash, t);
+          return t;
+        });
       });
     });
 
