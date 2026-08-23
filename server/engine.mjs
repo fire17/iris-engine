@@ -315,30 +315,32 @@ async function ensureHls(torrent, file, ih, idx, startT = 0) {
     const audioArgs = copyAudio ? ['-c:a', 'copy']
       : ['-af', 'aresample=async=1:first_pts=0', '-c:a', 'aac', '-ac', '2', '-b:a', '192k'];
     let args, useStdin;
+    /* shared HLS output: fmp4 segments; the window flags bound RAM (INMEM) / disk to the
+       last HLS_WINDOW segments regardless of film length. */
+    const hlsOut = ['-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
+      '-c:v', 'copy', ...hevcTag, ...audioArgs,
+      '-f', 'hls', '-hls_time', '4', '-hls_segment_type', 'fmp4',
+      '-hls_fmp4_init_filename', 'init.mp4',
+      '-hls_segment_filename', path.join(dir, 'seg%05d.m4s'), path.join(dir, 'index.m3u8')];
+    const windowFlags = ['-hls_list_size', String(HLS_WINDOW), '-hls_flags', 'delete_segments+independent_segments'];
     if (INMEM) {
-      /* read our OWN /stream endpoint (Range-backed) so -ss seeks to any offset; burst the
-         first ~30s for a snappy start/seek, then pace to ~1x so the bounded sliding window
-         tracks the playhead instead of racing to the credits and evicting everything. */
+      /* read our OWN Range-backed /stream so -ss can jump to any offset (a pipe cannot seek,
+         and cannot read an mp4 whose moov index sits at the end). Auto-reconnect hardens the
+         HTTP input so a transient piece-fetch stall/reset on a fresh or slow swarm reconnects
+         instead of killing the whole transcode — this is what keeps a cold-torrent start from
+         collapsing into the client's reconnect loop. Burst ~30s for a snappy start/seek, then
+         pace to ~1x so the bounded sliding window tracks the playhead, not the credits. */
       const src = `http://127.0.0.1:${PORT}/stream/${encodeURIComponent(ih)}/${idx}`;
       args = ['-hide_banner', '-loglevel', 'error', '-nostdin',
+        '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_on_network_error', '1', '-reconnect_delay_max', '30',
         ...(startT > 0 ? ['-ss', String(startT)] : []),
         '-readrate', '1', '-readrate_initial_burst', '30',
-        '-i', src,
-        '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
-        '-c:v', 'copy', ...hevcTag, ...audioArgs,
-        '-f', 'hls', '-hls_time', '4', '-hls_segment_type', 'fmp4',
-        '-hls_list_size', String(HLS_WINDOW), '-hls_flags', 'delete_segments+independent_segments',
-        '-hls_fmp4_init_filename', 'init.mp4',
-        '-hls_segment_filename', path.join(dir, 'seg%05d.m4s'), path.join(dir, 'index.m3u8')];
+        '-i', src, ...windowFlags, ...hlsOut];
       useStdin = false;
     } else {
+      /* localhost + disk: pipe → one full VOD (event) playlist, already seekable */
       args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-i', 'pipe:0',
-        '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
-        '-c:v', 'copy', ...hevcTag, ...audioArgs,
-        '-f', 'hls', '-hls_time', '4', '-hls_segment_type', 'fmp4',
-        '-hls_playlist_type', 'event', '-hls_flags', 'independent_segments',
-        '-hls_fmp4_init_filename', 'init.mp4',
-        '-hls_segment_filename', path.join(dir, 'seg%05d.m4s'), path.join(dir, 'index.m3u8')];
+        '-hls_playlist_type', 'event', '-hls_flags', 'independent_segments', ...hlsOut];
       useStdin = true;
     }
     const proc = (job.proc = spawn(FFMPEG, args, { stdio: [useStdin ? 'pipe' : 'ignore', 'ignore', 'pipe'] }));
