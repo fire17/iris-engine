@@ -270,14 +270,21 @@ const jobKey = (ih, idx) => ih + ':' + idx;
 function probeHead(file) {
   return new Promise((resolve) => {
     const rs = file.createReadStream({ start: 0, end: Math.min(file.length - 1, 6 * 1024 * 1024) });
-    const pr = execFile(FFPROBE, ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name', '-of', 'json', 'pipe:0'],
+    const pr = execFile(FFPROBE, ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type,codec_name', '-of', 'json', 'pipe:0'],
       { maxBuffer: 1 << 20 }, (err, out) => {
         rs.destroy();
         if (err) return resolve(null);
         try {
-          const streams = JSON.parse(out).streams || [];
+          const j = JSON.parse(out);
+          const streams = j.streams || [];
+          /* total film length so the player can label the seek bar with the WHOLE movie,
+             not just the transcoded-so-far window (mkv/webm carry it in the header, which
+             is inside the 6 MB head we probe). null when the head lacks it → player falls
+             back to <video>.duration. */
+          const dur = j.format && Number.parseFloat(j.format.duration);
           resolve({ video: (streams.find((x) => x.codec_type === 'video') || {}).codec_name || null,
-                    audio: (streams.find((x) => x.codec_type === 'audio') || {}).codec_name || null });
+                    audio: (streams.find((x) => x.codec_type === 'audio') || {}).codec_name || null,
+                    dur: (Number.isFinite(dur) && dur > 0) ? dur : null });
         } catch { resolve(null); }
       });
     rs.on('error', () => {}); rs.pipe(pr.stdin).on('error', () => {});
@@ -536,9 +543,19 @@ const server = http.createServer((req, res) => {
   // GET /hls/<infoHash>/<fileIdx>/<segment>
   if (parts[0] === 'hls' && parts.length === 4) {
     const infoHash = normaliseHash(parts[1]);
-    const job = infoHash && jobs.get(jobKey(infoHash, Number.parseInt(parts[2], 10)));
+    const fi = Number.parseInt(parts[2], 10);
     const name = path.basename(parts[3]);
-    if (!job || !/^(index\.m3u8|init\.mp4|seg\d+\.m4s)$/.test(name)) return send(res, 404, 'no such stream');
+    if (!/^(index\.m3u8|init\.mp4|seg\d+\.m4s)$/.test(name)) return send(res, 404, 'no such stream');
+    let job = infoHash && jobs.get(jobKey(infoHash, fi));
+    if (!job) {
+      /* SELF-HEAL: the transcode job died (ffmpeg exit) or was evicted, but the torrent is
+         still resident. Restart it so the client's next poll gets a live playlist instead
+         of a permanent 404 — the browser retries the manifest on a 503 and resumes. */
+      const tor = infoHash && findTorrent(infoHash);
+      const file = tor && !Number.isNaN(fi) && tor.files[fi];
+      if (tor && file) { ensureHls(tor, file, infoHash, fi).catch(() => {}); return send(res, 503, 'stream restarting'); }
+      return send(res, 404, 'no such stream');
+    }
     const fp = path.join(job.dir, name);
     return fs.readFile(fp, (err, data) => {
       if (err) return send(res, 404, 'segment not ready');
