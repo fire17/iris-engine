@@ -263,7 +263,7 @@ function pickHlsDir() {
   catch { return path.join(CACHE, 'hls'); }
 }
 const HLS_DIR = pickHlsDir();
-const jobKey = (ih, idx) => ih + ':' + idx;
+const jobKey = (ih, idx, startT = 0) => ih + ':' + idx + ':' + startT;
 
 /** ffprobe the head of a torrent file (first ~6 MB via the torrent's own read stream, so
     undownloaded regions are waited for, never read as zeros). */
@@ -291,71 +291,99 @@ function probeHead(file) {
   });
 }
 
-/** Start (or reuse) the ffmpeg HLS job for one torrent file. Resolves when index.m3u8 has
-    its first segment, so the player never fetches an empty playlist. */
-async function ensureHls(torrent, file, ih, idx) {
-  const key = jobKey(ih, idx);
+/** Start (or reuse) the ffmpeg HLS job for one torrent file, optionally seeked to startT
+    seconds. This is what makes SEEKING work on an INMEM runner: the transcode reads our own
+    Range-seekable /stream URL (backed by the torrent's random access) so `-ss` can jump to
+    any offset — a pipe cannot seek. localhost pipes the file into one full VOD playlist
+    (already seekable), so it never needs an offset job. Resolves when index.m3u8 has its
+    first segment, so the player never fetches an empty playlist. */
+async function ensureHls(torrent, file, ih, idx, startT = 0) {
+  startT = Math.max(0, Math.floor(Number(startT) || 0));
+  const key = jobKey(ih, idx, startT);
   let job = jobs.get(key);
   if (job) return job.ready;
-  const dir = path.join(HLS_DIR, ih + '-' + idx);
+  const dir = path.join(HLS_DIR, ih + '-' + idx + '-' + startT);
   fs.rmSync(dir, { recursive: true, force: true }); fs.mkdirSync(dir, { recursive: true });
-  job = { dir, proc: null, probe: null, ready: null };
+  job = { dir, proc: null, probe: null, ready: null, startT };
   jobs.set(key, job);
   job.ready = (async () => {
     const probe = (job.probe = (await probeHead(file)) || { video: null, audio: null });
     const copyAudio = probe.audio && BROWSER_AUDIO.has(probe.audio);
-    const args = ['-hide_banner', '-loglevel', 'error', '-nostdin',
-      /* INMEM plays a movie through a bounded sliding window (delete_segments). Without
-         pacing, ffmpeg races the whole file to segments at ~50x realtime and evicts the
-         opening of the movie before the browser attaches — the viewer lands in the
-         credits. Pace input to ~realtime so the window tracks the playhead and the
-         player's startPosition:0 lands on t=0. (localhost keeps every segment, no pacing
-         needed there.) */
-      ...(INMEM ? ['-re'] : []),
-      '-i', 'pipe:0',
-      '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
-      '-c:v', 'copy', ...(probe.video === 'hevc' ? ['-tag:v', 'hvc1'] : []),
-      /* pad explicit silence so audio starts at pts 0 like the video (MKVs often start audio
-         ~1s late as a timestamp hole; hls.js/MSE re-align the first fragment and the sound
-         lands ~1s early) and resample asynchronously so it can never drift from the video */
-      ...(copyAudio ? ['-c:a', 'copy'] : ['-af', 'aresample=async=1:first_pts=0', '-c:a', 'aac', '-ac', '2', '-b:a', '192k']),
-      '-f', 'hls', '-hls_time', '4', '-hls_segment_type', 'fmp4',
-      /* INMEM: bounded sliding window — delete_segments evicts old .m4s so RAM stays ~HLS_WINDOW*segsize;
-         backward-seek past the window re-transcodes (documented in RUNNER.md). localhost: event playlist
-         keeps every segment on disk (seek anywhere), unchanged. */
-      ...(INMEM
-        ? ['-hls_list_size', String(HLS_WINDOW), '-hls_flags', 'delete_segments+independent_segments']
-        : ['-hls_playlist_type', 'event', '-hls_flags', 'independent_segments']),
-      '-hls_fmp4_init_filename', 'init.mp4',
-      '-hls_segment_filename', path.join(dir, 'seg%05d.m4s'), path.join(dir, 'index.m3u8')];
-    const proc = (job.proc = spawn(FFMPEG, args, { stdio: ['pipe', 'ignore', 'pipe'] }));
+    const hevcTag = probe.video === 'hevc' ? ['-tag:v', 'hvc1'] : [];
+    /* pad explicit silence so audio starts at pts 0 like the video (MKVs often start audio
+       ~1s late as a timestamp hole) and resample async so it can never drift from the video */
+    const audioArgs = copyAudio ? ['-c:a', 'copy']
+      : ['-af', 'aresample=async=1:first_pts=0', '-c:a', 'aac', '-ac', '2', '-b:a', '192k'];
+    let args, useStdin;
+    if (INMEM) {
+      /* read our OWN /stream endpoint (Range-backed) so -ss seeks to any offset; burst the
+         first ~30s for a snappy start/seek, then pace to ~1x so the bounded sliding window
+         tracks the playhead instead of racing to the credits and evicting everything. */
+      const src = `http://127.0.0.1:${PORT}/stream/${encodeURIComponent(ih)}/${idx}`;
+      args = ['-hide_banner', '-loglevel', 'error', '-nostdin',
+        ...(startT > 0 ? ['-ss', String(startT)] : []),
+        '-readrate', '1', '-readrate_initial_burst', '30',
+        '-i', src,
+        '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
+        '-c:v', 'copy', ...hevcTag, ...audioArgs,
+        '-f', 'hls', '-hls_time', '4', '-hls_segment_type', 'fmp4',
+        '-hls_list_size', String(HLS_WINDOW), '-hls_flags', 'delete_segments+independent_segments',
+        '-hls_fmp4_init_filename', 'init.mp4',
+        '-hls_segment_filename', path.join(dir, 'seg%05d.m4s'), path.join(dir, 'index.m3u8')];
+      useStdin = false;
+    } else {
+      args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-i', 'pipe:0',
+        '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
+        '-c:v', 'copy', ...hevcTag, ...audioArgs,
+        '-f', 'hls', '-hls_time', '4', '-hls_segment_type', 'fmp4',
+        '-hls_playlist_type', 'event', '-hls_flags', 'independent_segments',
+        '-hls_fmp4_init_filename', 'init.mp4',
+        '-hls_segment_filename', path.join(dir, 'seg%05d.m4s'), path.join(dir, 'index.m3u8')];
+      useStdin = true;
+    }
+    const proc = (job.proc = spawn(FFMPEG, args, { stdio: [useStdin ? 'pipe' : 'ignore', 'ignore', 'pipe'] }));
     let errTail = '';
     // spawn failure (ffmpeg not on PATH → ENOENT) emits 'error' on the child; with NO
-    // listener Node throws it as an uncaught exception and the whole engine dies, taking
-    // every other client's stream with it. Capture it so this one torrent rejects cleanly
-    // and /play falls back to the raw stream (below) instead of crashing the runner.
+    // listener Node throws it as an uncaught exception and the whole engine dies. Capture it
+    // so this one torrent rejects cleanly and /play falls back to the raw stream instead.
     let spawnErr = null;
     proc.on('error', (e) => { spawnErr = e; jobs.delete(key); });
     proc.stderr.on('data', (d) => { errTail = (errTail + d).slice(-600); });
     proc.on('exit', (code) => {
       if (code) { console.error('[hls]', key, 'ffmpeg exit', code, errTail.trim().split('\n').pop()); jobs.delete(key); }
     });
-    const rs = file.createReadStream();
-    rs.on('error', () => {}); rs.pipe(proc.stdin).on('error', () => {});
-    proc.on('exit', () => rs.destroy());
+    let rs = null;
+    if (useStdin) {
+      rs = file.createReadStream();
+      rs.on('error', () => {}); rs.pipe(proc.stdin).on('error', () => {});
+      proc.on('exit', () => rs.destroy());
+    }
     // wait for the first segment (ffmpeg needs ~hls_time seconds of input first)
     const m3u8 = path.join(dir, 'index.m3u8');
     const t0 = Date.now();
     while (Date.now() - t0 < 60000) {
       if (spawnErr) throw new Error('ffmpeg unavailable: ' + spawnErr.message);
       if (proc.exitCode !== null && proc.exitCode !== 0) throw new Error('ffmpeg failed: ' + errTail.trim());
-      try { if (fs.readFileSync(m3u8, 'utf8').includes('#EXTINF')) return job; } catch { /* not yet */ }
+      try { if (fs.readFileSync(m3u8, 'utf8').includes('#EXTINF')) { evictOtherOffsets(ih, idx, key); return job; } } catch { /* not yet */ }
       await new Promise((r) => setTimeout(r, 250));
     }
     throw new Error('transcode produced no segment in 60s');
   })();
   job.ready.catch(() => jobs.delete(key));
   return job.ready;
+}
+
+/** Once a new offset job for (ih,idx) is ready, kill the sibling offset jobs: the client has
+    switched its HLS source to this one, so the old ffmpeg + its RAM segments are dead weight.
+    Keeps at most one active transcode per file, so seeking never leaks processes or memory. */
+function evictOtherOffsets(ih, idx, keepKey) {
+  const prefix = ih + ':' + idx + ':';
+  for (const [k, j] of jobs) {
+    if (k === keepKey || !k.startsWith(prefix)) continue;
+    try { j.proc?.kill('SIGKILL'); } catch { /* gone */ }
+    try { fs.rmSync(j.dir, { recursive: true, force: true }); } catch { /* */ }
+    jobs.delete(k);
+  }
 }
 
 function stopJobs(ih) {
@@ -530,9 +558,12 @@ const server = http.createServer((req, res) => {
         return send(res, 200, { ok: true, kind: 'url', url: `${base}/stream/${infoHash}/${fi}`, file: file.name, reason: 'browser-native container' });
       }
       try {
-        const job = await ensureHls(torrent, file, infoHash, fi);
-        return send(res, 200, { ok: true, kind: 'hls', url: `${base}/hls/${infoHash}/${fi}/index.m3u8`, file: file.name,
-          probe: job.probe, reason: 'transcoded: audio→AAC, video copied (browser cannot decode ' + (job.probe?.audio || extOf(file.name)) + ')' });
+        /* ?t=<seconds> seeks the transcode to that offset (INMEM) so the player can jump
+           anywhere; the offset is embedded in the HLS path so its segments stay separate. */
+        const startT = Math.max(0, Math.floor(Number(url.searchParams.get('t')) || 0));
+        const job = await ensureHls(torrent, file, infoHash, fi, startT);
+        return send(res, 200, { ok: true, kind: 'hls', url: `${base}/hls/${infoHash}/${fi}/${startT}/index.m3u8`, file: file.name,
+          offset: startT, probe: job.probe, reason: 'transcoded: audio→AAC, video copied (browser cannot decode ' + (job.probe?.audio || extOf(file.name)) + ')' });
       } catch (e) {
         console.error('[play]', infoHash, e.message);
         return send(res, 200, { ok: true, kind: 'url', url: `${base}/stream/${infoHash}/${fi}`, file: file.name, reason: 'transcode unavailable: ' + e.message });
@@ -540,20 +571,21 @@ const server = http.createServer((req, res) => {
     }, (err) => send(res, 504, { ok: false, error: 'metadata: ' + (err?.message || 'unknown') }));
   }
 
-  // GET /hls/<infoHash>/<fileIdx>/<segment>
-  if (parts[0] === 'hls' && parts.length === 4) {
+  // GET /hls/<infoHash>/<fileIdx>/<startT>/<segment>
+  if (parts[0] === 'hls' && parts.length === 5) {
     const infoHash = normaliseHash(parts[1]);
     const fi = Number.parseInt(parts[2], 10);
-    const name = path.basename(parts[3]);
+    const startT = Math.max(0, Math.floor(Number(parts[3]) || 0));
+    const name = path.basename(parts[4]);
     if (!/^(index\.m3u8|init\.mp4|seg\d+\.m4s)$/.test(name)) return send(res, 404, 'no such stream');
-    let job = infoHash && jobs.get(jobKey(infoHash, fi));
+    let job = infoHash && jobs.get(jobKey(infoHash, fi, startT));
     if (!job) {
       /* SELF-HEAL: the transcode job died (ffmpeg exit) or was evicted, but the torrent is
-         still resident. Restart it so the client's next poll gets a live playlist instead
-         of a permanent 404 — the browser retries the manifest on a 503 and resumes. */
+         still resident. Restart it at the same offset so the client's next poll gets a live
+         playlist instead of a permanent 404 — the browser retries the manifest on a 503. */
       const tor = infoHash && findTorrent(infoHash);
       const file = tor && !Number.isNaN(fi) && tor.files[fi];
-      if (tor && file) { ensureHls(tor, file, infoHash, fi).catch(() => {}); return send(res, 503, 'stream restarting'); }
+      if (tor && file) { ensureHls(tor, file, infoHash, fi, startT).catch(() => {}); return send(res, 503, 'stream restarting'); }
       return send(res, 404, 'no such stream');
     }
     const fp = path.join(job.dir, name);
