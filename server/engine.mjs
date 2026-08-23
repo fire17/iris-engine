@@ -315,6 +315,12 @@ async function ensureHls(torrent, file, ih, idx) {
       '-hls_segment_filename', path.join(dir, 'seg%05d.m4s'), path.join(dir, 'index.m3u8')];
     const proc = (job.proc = spawn(FFMPEG, args, { stdio: ['pipe', 'ignore', 'pipe'] }));
     let errTail = '';
+    // spawn failure (ffmpeg not on PATH → ENOENT) emits 'error' on the child; with NO
+    // listener Node throws it as an uncaught exception and the whole engine dies, taking
+    // every other client's stream with it. Capture it so this one torrent rejects cleanly
+    // and /play falls back to the raw stream (below) instead of crashing the runner.
+    let spawnErr = null;
+    proc.on('error', (e) => { spawnErr = e; jobs.delete(key); });
     proc.stderr.on('data', (d) => { errTail = (errTail + d).slice(-600); });
     proc.on('exit', (code) => {
       if (code) { console.error('[hls]', key, 'ffmpeg exit', code, errTail.trim().split('\n').pop()); jobs.delete(key); }
@@ -326,6 +332,7 @@ async function ensureHls(torrent, file, ih, idx) {
     const m3u8 = path.join(dir, 'index.m3u8');
     const t0 = Date.now();
     while (Date.now() - t0 < 60000) {
+      if (spawnErr) throw new Error('ffmpeg unavailable: ' + spawnErr.message);
       if (proc.exitCode !== null && proc.exitCode !== 0) throw new Error('ffmpeg failed: ' + errTail.trim());
       try { if (fs.readFileSync(m3u8, 'utf8').includes('#EXTINF')) return job; } catch { /* not yet */ }
       await new Promise((r) => setTimeout(r, 250));
@@ -583,6 +590,12 @@ server.listen(PORT, HOST, () => {
   console.log(`  cache: ${INMEM ? '(in-memory — no disk cache)' : CACHE}`);
   console.log(`  GET /status · GET /torrents · GET /stream/<infoHash>/<fileIdx> · DELETE /torrent/<infoHash>`);
 });
+
+// Durability: a single client's bad request (a codec ffmpeg chokes on, a torrent that
+// stalls, an async 'error' event we missed) must never take down an engine serving many
+// clients. Log and stay up — the offending request already fails on its own path.
+process.on('uncaughtException', (e) => console.error('[uncaught]', e?.stack || e?.message || e));
+process.on('unhandledRejection', (e) => console.error('[unhandled]', e?.stack || e?.message || e));
 
 let closing = false;
 for (const sig of ['SIGINT', 'SIGTERM']) {
