@@ -291,6 +291,24 @@ function probeHead(file) {
   });
 }
 
+/** Whole-film duration, robust to a trailing moov. Non-faststart mp4/mov keep their duration
+    in a `moov` atom at the END of the file, which the 6 MB head probe (a non-seekable pipe)
+    can never reach — so probeHead returns dur:null and the player would fall back to
+    <video>.duration (only the transcoded-so-far window). ffprobe our OWN Range-seekable
+    /stream URL instead: it issues a suffix range for the moov wherever it sits and reports the
+    real length for every container. Runs in the BACKGROUND (never blocks first-frame) and only
+    fetches the file tail, which the client picks up on its next /play poll. */
+function probeDurationURL(streamUrl) {
+  return new Promise((resolve) => {
+    execFile(FFPROBE, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', streamUrl],
+      { timeout: 45000, maxBuffer: 1 << 16 }, (err, out) => {
+        if (err) return resolve(null);
+        const d = Number.parseFloat(String(out).trim());
+        resolve(Number.isFinite(d) && d > 0 ? d : null);
+      });
+  });
+}
+
 /** Start (or reuse) the ffmpeg HLS job for one torrent file, optionally seeked to startT
     seconds. This is what makes SEEKING work on an INMEM runner: the transcode reads our own
     Range-seekable /stream URL (backed by the torrent's random access) so `-ss` can jump to
@@ -321,6 +339,14 @@ async function ensureHls(torrent, file, ih, idx, startT = 0) {
   } catch { /* prioritisation is an optimisation, never fatal */ }
   job.ready = (async () => {
     const probe = (job.probe = (await probeHead(file)) || { video: null, audio: null });
+    /* If the head lacked the duration (trailing-moov mp4/mov), fetch the WHOLE-film length in
+       the background over the seekable /stream URL and patch it in. Never awaited — first-frame
+       must not wait on a file-tail fetch; the client re-polls /play until dur lands. Only for
+       t=0: an offset job shares the same film, so its dur is discovered by the t=0 job. */
+    if (startT === 0 && !probe.dur) {
+      const durUrl = `http://127.0.0.1:${PORT}/stream/${encodeURIComponent(ih)}/${idx}`;
+      probeDurationURL(durUrl).then((d) => { if (d && job.probe) job.probe.dur = d; }).catch(() => {});
+    }
     const copyAudio = probe.audio && BROWSER_AUDIO.has(probe.audio);
     const hevcTag = probe.video === 'hevc' ? ['-tag:v', 'hvc1'] : [];
     /* pad explicit silence so audio starts at pts 0 like the video (MKVs often start audio
